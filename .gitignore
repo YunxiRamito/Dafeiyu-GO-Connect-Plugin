@@ -1,0 +1,54 @@
+# Local experiments, installed runtimes and QA evidence are not source releases.
+/Temp/
+/temp/
+/tmp/
+/runtime/
+/runtimes/
+/node_modules/
+**/node_modules/
+/.npm/
+/.cache/
+/.npmrc
+/.yarnrc.yml
+/coverage/
+/.dsh/
+/.aries/
+/.connection/
+
+# Host state and credentials belong to the native launcher, never this plugin.
+/secrets/
+/private/
+/credentials/
+/identities/
+.env
+.env.*
+!.env.example
+auth.json
+credentials.json
+device-identity.json
+device_identity.json
+pairing.json
+tokens.json
+oauth.json
+*.private.json
+*.secrets.json
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# Packages and logs are produced in the G-drive QA directory and reviewed
+# separately from the source repository. Keep generated lib/ in source commits.
+*.log
+*.tgz
+*.tar.gz
+*.zip
+*.7z
+*.apk
+*.aab
+*.pyc
+__pycache__/
+.DS_Store
+Thumbs.db

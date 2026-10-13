@@ -1,0 +1,41 @@
+{
+  "name": "dafeiyu-go-connect",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "description": "Dafeiyu-Go / DSH-Aries connection plugin for encrypted group transport, remote DSH tasks, workspace metadata and safe web tunneling.",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./source": "./src/index.ts",
+    "./framework": "./lib/framework/index.js",
+    "./sync": "./lib/sync/index.js",
+    "./broadcast": "./lib/broadcast/index.js",
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test tests/framework/*.test.ts tests/sync/*.test.ts tests/broadcast/*.test.mjs",
+    "check": "node --check src/index.ts && node --check src/framework/index.ts && node --check src/sync/index.ts && node --check src/broadcast/index.ts && node --check lib/index.js",
+    "build": "node scripts/build-lib.mjs"
+  },
+  "files": [
+    "lib/",
+    "src/",
+    "docs/",
+    "cordis.patch.yml",
+    "package.json",
+    "README.md",
+    "scripts/"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "pluginApi": "dafeiyu-go.connection.v1",
+    "entry": "./lib/index.js"
+  },
+  "license": "MIT"
+}

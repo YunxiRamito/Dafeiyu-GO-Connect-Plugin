@@ -1,0 +1,519 @@
+import path from 'node:path'
+import { createHash, randomUUID } from 'node:crypto'
+import { lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { mergeConfig, type PluginConfig } from './config.ts'
+import { ConnectionPluginError } from './errors.ts'
+import { readBoundedJson } from './node-transport.ts'
+import { decideSyncPath } from './path-policy.ts'
+import { createBroadcastPayload, sanitizeIncomingBroadcast, type BroadcastPayload } from './broadcast.ts'
+import type { ConnectionProvider, ConnectionState, EncryptedMessage } from './provider.ts'
+import { validateConnectionState } from './launcher-provider.ts'
+import { FrameworkSyncAdapter } from './sync-adapter.ts'
+import { WorkspaceSynchronizer } from '../sync/engine.ts'
+import { JsonQueueStore, SyncQueue } from '../sync/queue.ts'
+import { assertPathAllowed, resolveWorkspacePath } from '../sync/path-filter.ts'
+import { TransferStateMachine } from '../sync/transfer.ts'
+import type { IncomingTransfer, WorkspaceSyncConfig } from '../sync/types.ts'
+import { SyncError } from '../sync/types.ts'
+import { PermissionSet } from './permissions.ts'
+import type { RemoteDshHost } from './remote-host.ts'
+
+export type ConfigPatch = { [K in keyof PluginConfig]?: Partial<PluginConfig[K]> }
+export function patchConfig(base: PluginConfig, patch: ConfigPatch = {}): PluginConfig {
+  return mergeConfig({ workspaceSync: { ...base.workspaceSync, ...patch.workspaceSync },
+    broadcast: { ...base.broadcast, ...patch.broadcast }, limits: { ...base.limits, ...patch.limits } })
+}
+interface Conflict { group_id: string; transfer_id: string; relative_path: string; local_hash: string | null; remote_hash: string }
+interface DurableState {
+  schema_version: 1
+  config: PluginConfig
+  paused: boolean
+  groups: Record<string, { cursor?: string; seen: string[] }>
+  conflicts: Conflict[]
+  baselines: Record<string, string>
+}
+export interface RuntimeOptions {
+  provider: ConnectionProvider
+  permissions: PermissionSet
+  config?: ConfigPatch
+  home?: string
+  stateDirectory?: string
+  pollMs?: number
+  remoteHost?: RemoteDshHost
+}
+
+export class ConnectionRuntime {
+  readonly ready: Promise<void>
+  readonly queue: SyncQueue
+  private readonly provider: ConnectionProvider
+  private readonly permissions: PermissionSet
+  private readonly adapter: FrameworkSyncAdapter
+  private readonly directory?: string
+  private readonly home?: string
+  private readonly options: RuntimeOptions
+  private durable: DurableState
+  private history: Array<{ group_id: string; message_id: string; payload: BroadcastPayload }> = []
+  private stop = new AbortController()
+  private operation?: AbortController
+  private operationDone?: Promise<unknown>
+  private timer?: ReturnType<typeof setInterval>
+  private pendingPoll?: Promise<void>
+  private saves: Promise<void> = Promise.resolve()
+  private unsubscribe?: () => void
+  private disposed = false
+  private snapshot?: ConnectionState
+  private nativeFingerprint?: string
+  private syncStatus = 'disabled'
+  private lastError?: string
+  private readonly remoteHost?: RemoteDshHost
+
+  constructor(options: RuntimeOptions) {
+    this.options = options
+    this.provider = options.provider
+    this.permissions = options.permissions
+    this.remoteHost = options.remoteHost
+    this.adapter = new FrameworkSyncAdapter(this.provider)
+    this.home = options.home
+    this.directory = options.stateDirectory ?? (this.home ? path.join(this.home, 'dafeiyu-connection-plugin') : undefined)
+    this.durable = { schema_version: 1, config: patchConfig(mergeConfig(undefined), options.config),
+      paused: false, groups: {}, conflicts: [], baselines: {} }
+    // Without an explicit host home, use memory rather than write into a guessed directory.
+    this.queue = new SyncQueue(this.directory
+      ? new JsonQueueStore(path.join(this.directory, 'queue.json'), this.directory)
+      : { load: async () => [], save: async () => {} })
+    this.ready = this.initialize()
+    this.ready.catch(() => { this.lastError = 'state_restore_failed' })
+  }
+
+  private async initialize(): Promise<void> {
+    if (this.directory) {
+      try {
+        const value = await readBoundedJson(path.join(this.directory, 'state.json'), 2 * 1024 * 1024)
+        if (value.schema_version !== 1 || typeof value.paused !== 'boolean' || !value.config ||
+            !value.groups || !Array.isArray(value.conflicts) || !value.baselines)
+          throw new Error('invalid_state')
+        this.durable = { ...value, config: patchConfig(mergeConfig(value.config), this.options.config) }
+      } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+    }
+    this.applyConfig({})
+    await this.queue.restore()
+    // Interrupted processes must resume through the queue state machine.
+    for (const item of this.queue.list()) {
+      if (['creating', 'uploading'].includes(item.status))
+        await this.queue.upsert(new TransferStateMachine(item).pause())
+    }
+    await this.readNativePreferences()
+    if (this.disposed) return
+    this.permissions.require('connection.state.subscribe')
+    this.unsubscribe = this.provider.subscribe_connection_state(state => {
+      try { this.acceptSnapshot(validateConnectionState(state)) } catch { this.snapshot = undefined }
+    })
+    this.timer = setInterval(() => { void this.pollOnce().catch(error => { this.lastError = this.errorCode(error) }) }, this.options.pollMs ?? 2000)
+    this.timer.unref()
+    void this.pollOnce().catch(error => { this.lastError = this.errorCode(error) })
+  }
+
+  getConfig(): PluginConfig { return structuredClone(this.durable.config) }
+  getStatus() { return { status: this.durable.paused ? 'paused' : this.syncStatus, error_code: this.lastError,
+    group_id: this.snapshot?.group_id ?? null, persistent: Boolean(this.directory) } }
+  async setConfig(patch: ConfigPatch): Promise<void> {
+    await this.ready
+    this.assertActive()
+    this.applyConfig(patch)
+    await this.save()
+  }
+  private applyConfig(patch: ConfigPatch): void {
+    const previous = this.durable.config
+    const next = patchConfig(previous, patch)
+    if (next.workspaceSync.root !== null) {
+      if (typeof next.workspaceSync.root !== 'string' || !next.workspaceSync.root.trim() || !path.isAbsolute(next.workspaceSync.root))
+        throw new ConnectionPluginError('validation_failed', 'Workspace root must be an explicitly selected absolute path.')
+      next.workspaceSync.root = path.resolve(next.workspaceSync.root)
+    }
+    if (typeof next.workspaceSync.enabled !== 'boolean' || (next.workspaceSync.root !== null && typeof next.workspaceSync.root !== 'string') ||
+        !['manual', 'watch'].includes(next.workspaceSync.mode) || !['ask', 'keep_local', 'keep_remote', 'keep_both'].includes(next.workspaceSync.conflictPolicy) ||
+        typeof next.broadcast.enabled !== 'boolean' || !Number.isSafeInteger(next.limits.chunkBytes) ||
+        next.limits.chunkBytes < 1 || next.limits.chunkBytes > 512 * 1024 ||
+        !Number.isSafeInteger(next.limits.maxFileBytes) || next.limits.maxFileBytes < 0 ||
+        next.limits.maxFileBytes > 256 * 1024 * 1024 || !Number.isSafeInteger(next.limits.maxQueuedTasks) ||
+        next.limits.maxQueuedTasks < 1 || next.limits.maxQueuedTasks > 1000 ||
+        !Number.isSafeInteger(next.limits.retryAttempts) || next.limits.retryAttempts < 0 || next.limits.retryAttempts > 5 ||
+        !Number.isSafeInteger(next.limits.requestTimeoutMs) || next.limits.requestTimeoutMs < 1 || next.limits.requestTimeoutMs > 60_000)
+      throw new ConnectionPluginError('validation_failed', 'Invalid connection configuration.')
+    this.durable.config = next
+    if (previous.workspaceSync.root !== next.workspaceSync.root || !next.workspaceSync.enabled) this.operation?.abort()
+    this.syncStatus = next.workspaceSync.enabled ? 'waiting_for_connection' : 'disabled'
+  }
+  private async readNativePreferences(): Promise<void> {
+    if (!this.home) return
+    try {
+      const value = await readBoundedJson(path.join(this.home, 'dafeiyu-connection-preferences.json'))
+      if (value.schema_version !== 1 || typeof value.workspace_sync?.enabled !== 'boolean' ||
+          (value.workspace_sync.root !== null && typeof value.workspace_sync.root !== 'string') ||
+          typeof value.web_broadcast?.enabled !== 'boolean')
+        throw new Error('invalid_preferences')
+      const fingerprint = JSON.stringify(value)
+      if (fingerprint !== this.nativeFingerprint) {
+        this.applyConfig({ workspaceSync: { enabled: value.workspace_sync.enabled, root: value.workspace_sync.root },
+          broadcast: { enabled: value.web_broadcast.enabled } })
+        await this.save()
+        this.nativeFingerprint = fingerprint
+      }
+      if (this.lastError === 'invalid_native_preferences') this.lastError = undefined
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') this.lastError = 'invalid_native_preferences'
+    }
+  }
+  private save(): Promise<void> {
+    if (!this.directory) return Promise.resolve()
+    const content = JSON.stringify(this.durable)
+    const operation = this.saves.catch(() => {}).then(async () => {
+      await mkdir(this.directory!, { recursive: true })
+      const temporary = path.join(this.directory!, `state-${randomUUID()}.tmp`)
+      try {
+        await writeFile(temporary, content, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+        await rename(temporary, path.join(this.directory!, 'state.json'))
+      } finally { await rm(temporary, { force: true }).catch(() => {}) }
+    })
+    this.saves = operation
+    return operation
+  }
+  private assertActive(): void {
+    if (this.disposed) throw new ConnectionPluginError('request_cancelled', 'Plugin disposed.')
+  }
+  private errorCode(error: unknown): string {
+    return error instanceof ConnectionPluginError || error instanceof SyncError ? error.code : 'runtime_failed'
+  }
+  private acceptSnapshot(state: ConnectionState): void {
+    if (this.snapshot?.group_id !== state.group_id || state.pairing_status !== 'paired') {
+      this.operation?.abort()
+      this.history = []
+    }
+    this.snapshot = state
+  }
+  private async current(signal?: AbortSignal): Promise<ConnectionState> {
+    this.permissions.require('connection.read')
+    const state = validateConnectionState((await this.provider.get_connection_state({ signal })).data)
+    this.acceptSnapshot(state)
+    if (!state.server_connected || state.pairing_status !== 'paired' || !state.group_id)
+      throw new ConnectionPluginError('connection_unavailable', 'Current paired group is unavailable.')
+    return state
+  }
+  private async verifyGroup(group: string, signal: AbortSignal): Promise<void> {
+    const state = await this.current(signal)
+    if (state.group_id !== group) throw new ConnectionPluginError('request_cancelled', 'Group changed.')
+  }
+  async pause(): Promise<{ status: string }> {
+    await this.ready
+    this.permissions.require('workspace.read')
+    this.durable.paused = true
+    this.operation?.abort()
+    await this.operationDone?.catch(() => {})
+    await this.save()
+    return { status: 'paused' }
+  }
+  async resume(): Promise<{ status: string }> {
+    await this.ready
+    this.permissions.require('workspace.read')
+    this.durable.paused = false
+    await this.save()
+    const result = await this.syncNow()
+    return { status: result.status }
+  }
+  async setMuted(muted: boolean) { await this.setConfig({ broadcast: { muted } }); return { muted } }
+  async getConflicts() {
+    await this.ready
+    this.permissions.require('workspace.read')
+    const state = await this.current(this.stop.signal)
+    return this.durable.conflicts.filter(item => item.group_id === state.group_id).map(item => ({ ...item }))
+  }
+  async getHistory() {
+    await this.ready
+    this.permissions.require('broadcast.receive')
+    const state = await this.current(this.stop.signal)
+    return this.history.filter(item => item.group_id === state.group_id).map(item => structuredClone(item))
+  }
+  async clearHistory() {
+    await this.ready
+    this.permissions.require('broadcast.receive')
+    this.history = []
+    return { cleared: true }
+  }
+
+  async pollOnce(): Promise<void> {
+    await this.ready
+    if (this.disposed) return
+    if (this.pendingPoll) return this.pendingPoll
+    const poll = this.poll()
+    this.pendingPoll = poll
+    try { await poll } finally { this.pendingPoll = undefined }
+  }
+  private async poll(): Promise<void> {
+    await this.readNativePreferences()
+    const state = await this.current(this.stop.signal)
+    await this.remoteHost?.advertise(state)
+    const group = state.group_id!
+    if (((this.durable.config.broadcast.enabled && !this.durable.config.broadcast.receivePaused) || this.remoteHost) && state.capabilities.encrypted_messages) {
+      this.permissions.require('connection.message.read')
+      if (this.durable.config.broadcast.enabled) this.permissions.require('broadcast.receive')
+      const checkpoint = this.durable.groups[group] ??= { seen: [] }
+      const response = (await this.provider.list_incoming_messages({ group_id: group, cursor: checkpoint.cursor, limit: 100 }, { signal: this.stop.signal })).data
+      if (!Array.isArray(response.messages) || response.messages.length > 100) throw new ConnectionPluginError('protocol_error', 'Invalid message page.')
+      await this.verifyGroup(group, this.stop.signal)
+      let allHandled = true
+      for (const message of response.messages) {
+        if (!await this.receiveMessage(group, message, checkpoint)) allHandled = false
+      }
+      // Unknown message kinds belong to other plugins and must not be skipped.
+      if (allHandled && response.next_cursor) checkpoint.cursor = response.next_cursor
+      await this.save()
+    }
+    if (this.durable.config.workspaceSync.enabled && !this.durable.paused && !this.operationDone) {
+      const operation = new AbortController()
+      const cancel = () => operation.abort()
+      this.stop.signal.addEventListener('abort', cancel, { once: true })
+      this.operation = operation
+      const receiving = this.receiveFiles(group, operation.signal)
+      this.operationDone = receiving
+      try { await receiving }
+      finally {
+        this.operation = undefined
+        this.operationDone = undefined
+        this.stop.signal.removeEventListener('abort', cancel)
+      }
+      if (this.durable.config.workspaceSync.mode === 'watch') await this.syncNow()
+    }
+  }
+  private async receiveMessage(group: string, message: EncryptedMessage, checkpoint: { seen: string[] }): Promise<boolean> {
+    if (this.remoteHost && ['dsh_remote_request', 'dsh_remote_cancel', 'dsh_remote_ack'].includes(message.kind)) {
+      const handled = await this.remoteHost.receive(group, message)
+      if (handled) await this.provider.acknowledge_message({ group_id: group, message_id: message.message_id }, { signal: this.stop.signal })
+      return handled
+    }
+    if (!this.durable.config.broadcast.enabled || this.durable.config.broadcast.receivePaused) return false
+    if (!message || typeof message.message_id !== 'string' || !message.message_id || message.message_id.length > 256 ||
+        message.kind !== 'dsh_web_broadcast') return false
+    if (!checkpoint.seen.includes(message.message_id)) {
+      const payload = sanitizeIncomingBroadcast(message.body as Partial<BroadcastPayload>)
+      payload.sender_device_id = message.sender_device_id
+      this.history.push({ group_id: group, message_id: message.message_id, payload })
+      this.history = this.history.slice(-100)
+      checkpoint.seen.push(message.message_id)
+      checkpoint.seen = checkpoint.seen.slice(-1000)
+      // Persist only IDs before acknowledgement, never a URL or message body.
+      await this.save()
+    }
+    await this.verifyGroup(group, this.stop.signal)
+    await this.provider.acknowledge_message({ group_id: group, message_id: message.message_id }, { signal: this.stop.signal })
+    return true
+  }
+  async sendBroadcast(args: Record<string, unknown>, signal?: AbortSignal) {
+    await this.ready
+    this.assertActive()
+    this.permissions.require('broadcast.send')
+    this.permissions.require('connection.message.send')
+    const config = this.durable.config.broadcast
+    if (!config.enabled) throw new ConnectionPluginError('permission_denied', 'Web broadcast is disabled.')
+    const state = await this.current(signal)
+    if (!state.capabilities.web_broadcast || !state.capabilities.encrypted_messages)
+      throw new ConnectionPluginError('unsupported', 'Web broadcast is unavailable.')
+    if (typeof args.url !== 'string') throw new ConnectionPluginError('validation_failed', 'URL is required.')
+    const payload = createBroadcastPayload({ url: args.url, title: typeof args.title === 'string' ? args.title : '',
+      selection: typeof args.selection === 'string' ? args.selection : '', message: typeof args.message === 'string' ? args.message : '',
+      sender_device_id: state.local_device.id }, config)
+    const idempotency_key = `broadcast:${randomUUID()}`
+    const result = await this.provider.send_encrypted_message({ group_id: state.group_id!, kind: payload.kind,
+      body: payload, idempotency_key }, { signal })
+    return result.data
+  }
+
+  private syncConfig(): WorkspaceSyncConfig {
+    const config = this.durable.config
+    if (!config.workspaceSync.enabled || !config.workspaceSync.root)
+      throw new ConnectionPluginError('validation_failed', 'An enabled, explicitly selected workspace is required.')
+    return { ...config.workspaceSync, root: path.resolve(config.workspaceSync.root),
+      conflictPolicy: ({ ask: 'ask', keep_local: 'prefer-local', keep_remote: 'prefer-remote', keep_both: 'keep-both' } as const)[config.workspaceSync.conflictPolicy],
+      chunkSizeBytes: config.limits.chunkBytes, maxRetries: config.limits.retryAttempts, retryDelayMs: 250 }
+  }
+  private async allowedPath(root: string, relative: string, allowMissing = false): Promise<string> {
+    const normalized = assertPathAllowed(relative, { ignoreRules: this.durable.config.workspaceSync.ignoreRules })
+    const full = resolveWorkspacePath(root, normalized)
+    if (!decideSyncPath(root, full, this.durable.config.workspaceSync.ignoreRules).allowed)
+      throw new ConnectionPluginError('permission_denied', 'Workspace path rejected.')
+    const rootInfo = await lstat(root)
+    if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) throw new ConnectionPluginError('permission_denied', 'Workspace root must be a real directory.')
+    const resolvedRoot = await realpath(root)
+    let current = root
+    for (const component of normalized.split('/')) {
+      if (component.includes(':')) throw new ConnectionPluginError('permission_denied', 'Alternate data streams rejected.')
+      current = path.join(current, component)
+      try {
+        if ((await lstat(current)).isSymbolicLink()) throw new ConnectionPluginError('permission_denied', 'Workspace symlinks rejected.')
+        if (!decideSyncPath(resolvedRoot, await realpath(current)).allowed) throw new ConnectionPluginError('permission_denied', 'Resolved path escapes workspace.')
+      } catch (error) { if (allowMissing && (error as NodeJS.ErrnoException).code === 'ENOENT') break; throw error }
+    }
+    return full
+  }
+  async syncNow(relative?: string, signal?: AbortSignal): Promise<{ status: string; files?: number }> {
+    await this.ready
+    this.assertActive()
+    this.permissions.require('workspace.read')
+    this.permissions.require('connection.file.transfer')
+    if (this.durable.paused) return { status: 'paused' }
+    if (!this.durable.config.workspaceSync.enabled) return { status: 'disabled' }
+    // A receive operation must not consume a later explicit upload intent.
+    while (this.operationDone) {
+      await this.operationDone.catch(() => {})
+      this.assertActive()
+      if (signal?.aborted) throw new ConnectionPluginError('request_cancelled', 'Sync cancelled.')
+      if (this.durable.paused) return { status: 'paused' }
+      if (!this.durable.config.workspaceSync.enabled) return { status: 'disabled' }
+    }
+    const operation = new AbortController()
+    const cancel = () => operation.abort()
+    this.stop.signal.addEventListener('abort', cancel, { once: true })
+    signal?.addEventListener('abort', cancel, { once: true })
+    if (signal?.aborted || this.stop.signal.aborted) cancel()
+    this.operation = operation
+    const running = this.uploadWorkspace(relative, operation.signal)
+    this.operationDone = running
+    try { return await running }
+    catch (error) {
+      this.lastError = this.errorCode(error)
+      this.syncStatus = operation.signal.aborted ? 'paused' : 'failed'
+      throw error
+    } finally {
+      this.operation = undefined
+      this.operationDone = undefined
+      this.stop.signal.removeEventListener('abort', cancel)
+      signal?.removeEventListener('abort', cancel)
+    }
+  }
+  private async uploadWorkspace(relative: string | undefined, signal: AbortSignal): Promise<{ status: string; files: number }> {
+    const config = this.syncConfig()
+    const state = await this.current(signal)
+    const group = state.group_id!
+    const paths: string[] = []
+    const visit = async (prefix: string) => {
+      for (const entry of await readdir(path.join(config.root, prefix), { withFileTypes: true })) {
+        if (signal.aborted) throw new ConnectionPluginError('request_cancelled', 'Sync cancelled.')
+        const item = prefix ? `${prefix}/${entry.name}` : entry.name
+        if (!decideSyncPath(config.root, path.join(config.root, item), config.ignoreRules).allowed || entry.isSymbolicLink()) continue
+        if (entry.isDirectory()) { await this.allowedPath(config.root, item); await visit(item) }
+        else if (entry.isFile()) {
+          paths.push(item)
+          if (paths.length > this.durable.config.limits.maxQueuedTasks) throw new ConnectionPluginError('validation_failed', 'Workspace queue limit exceeded.')
+        }
+      }
+    }
+    if (relative) paths.push(relative)
+    else {
+      const info = await lstat(config.root)
+      if (!info.isDirectory() || info.isSymbolicLink()) throw new ConnectionPluginError('permission_denied', 'Invalid workspace root.')
+      await visit('')
+    }
+    const synchronizer = new WorkspaceSynchronizer(this.adapter, config, this.queue)
+    this.syncStatus = 'syncing'
+    let files = 0
+    for (const item of paths) {
+      const full = await this.allowedPath(config.root, item)
+      if ((await stat(full)).size > this.durable.config.limits.maxFileBytes) throw new ConnectionPluginError('validation_failed', 'File exceeds configured size limit.')
+      await this.verifyGroup(group, signal)
+      if (this.queue.list().length >= this.durable.config.limits.maxQueuedTasks) {
+        const completed = this.queue.list().find(item => item.status === 'completed')
+        if (completed) await this.queue.remove(completed.id)
+        else throw new ConnectionPluginError('validation_failed', 'Persistent queue limit exceeded.')
+      }
+      const queued = await synchronizer.uploadFile(item, signal)
+      if (queued.groupId !== group) throw new ConnectionPluginError('request_cancelled', 'Group changed.')
+      this.durable.baselines[`${group}\0${config.root}\0${item}`] = queued.sha256
+      files++
+      await this.save()
+    }
+    this.syncStatus = 'completed'
+    this.lastError = undefined
+    return { status: 'completed', files }
+  }
+  private async receiveFiles(group: string, signal: AbortSignal): Promise<void> {
+    this.permissions.require('workspace.write')
+    this.permissions.require('connection.file.transfer')
+    const config = this.syncConfig()
+    const transfers = await this.adapter.listIncomingFileTransfers({ groupId: group, signal })
+    for (const transfer of transfers) {
+      if (transfer.acknowledged) continue
+      if (this.durable.paused || !this.durable.config.workspaceSync.enabled || this.durable.config.workspaceSync.root !== config.root) return
+      if (transfer.sizeBytes > this.durable.config.limits.maxFileBytes) throw new ConnectionPluginError('validation_failed', 'Incoming file exceeds size limit.')
+      const full = await this.allowedPath(config.root, transfer.relativePath, true)
+      let localHash: string | null = null
+      try { localHash = createHash('sha256').update(await readFile(full)).digest('hex') }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+      const baselineKey = `${group}\0${config.root}\0${transfer.relativePath}`
+      // Even an identical local file must authenticate the incoming transfer before acknowledgement.
+      const conflict = localHash !== null && localHash !== transfer.sha256 && localHash !== this.durable.baselines[baselineKey]
+      if (conflict && config.conflictPolicy === 'ask') {
+        if (!this.durable.conflicts.some(item => item.group_id === group && item.transfer_id === transfer.fileId))
+          this.durable.conflicts.push({ group_id: group, transfer_id: transfer.fileId,
+            relative_path: transfer.relativePath, local_hash: localHash, remote_hash: transfer.sha256 })
+        this.durable.conflicts = this.durable.conflicts.slice(-100)
+        this.syncStatus = 'conflict'
+        await this.save()
+        continue
+      }
+      if (conflict && config.conflictPolicy === 'prefer-local') continue
+      const destination = conflict && config.conflictPolicy === 'keep-both'
+        ? `${transfer.relativePath}.remote-${transfer.sha256.slice(0, 12)}` : transfer.relativePath
+      await this.downloadAndCommit(config.root, destination, transfer, group, signal, destination === transfer.relativePath ? localHash : null)
+      this.durable.baselines[`${group}\0${config.root}\0${destination}`] = transfer.sha256
+      this.durable.conflicts = this.durable.conflicts.filter(item => item.group_id !== group || item.transfer_id !== transfer.fileId)
+      await this.save()
+      await this.adapter.acknowledgeFileTransfer({ groupId: group, fileId: transfer.fileId, idempotencyKey: `ack:${transfer.fileId}`, signal })
+    }
+  }
+  private async downloadAndCommit(root: string, relative: string, transfer: IncomingTransfer, group: string, signal: AbortSignal, expectedLocal: string | null): Promise<void> {
+    const target = await this.allowedPath(root, relative, true)
+    await mkdir(path.dirname(target), { recursive: true })
+    await this.allowedPath(root, relative, true)
+    const temporary = path.join(path.dirname(target), `.dafeiyu-${randomUUID()}.part`)
+    const hash = createHash('sha256')
+    let size = 0
+    try {
+      await writeFile(temporary, '', { flag: 'wx', mode: 0o600 })
+      for (let index = 0; index < transfer.totalChunks; index++) {
+        if (this.durable.paused || !this.durable.config.workspaceSync.enabled || this.durable.config.workspaceSync.root !== root)
+          throw new ConnectionPluginError('request_cancelled', 'Workspace configuration changed.')
+        const chunk = await this.adapter.downloadFileChunk({ groupId: group, fileId: transfer.fileId, chunkIndex: index, signal })
+        const expected = Math.min(transfer.chunkSizeBytes, transfer.sizeBytes - index * transfer.chunkSizeBytes)
+        if (chunk.byteLength !== expected) throw new ConnectionPluginError('protocol_error', 'Unexpected incoming chunk size.')
+        size += chunk.byteLength
+        hash.update(chunk)
+        await writeFile(temporary, chunk, { flag: 'a' })
+      }
+      if (size !== transfer.sizeBytes || hash.digest('hex') !== transfer.sha256) throw new ConnectionPluginError('protocol_error', 'Incoming file hash mismatch.')
+      await this.verifyGroup(group, signal)
+      await this.allowedPath(root, relative, true)
+      let currentHash: string | null = null
+      try { currentHash = createHash('sha256').update(await readFile(target)).digest('hex') }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+      if (currentHash !== expectedLocal) throw new ConnectionPluginError('conflict', 'Local file changed during download.')
+      if (signal.aborted || this.durable.paused || !this.durable.config.workspaceSync.enabled ||
+          this.durable.config.workspaceSync.root !== root || this.snapshot?.group_id !== group)
+        throw new ConnectionPluginError('request_cancelled', 'Workspace lifecycle changed.')
+      // Same-directory rename preserves the existing file on a failed commit.
+      await rename(temporary, target)
+    } finally { await rm(temporary, { force: true }).catch(() => {}) }
+  }
+
+  async dispose(): Promise<void> {
+    if (this.disposed) return
+    this.disposed = true
+    this.stop.abort()
+    this.operation?.abort()
+    if (this.timer) clearInterval(this.timer)
+    this.unsubscribe?.()
+    await this.remoteHost?.dispose()
+    await this.ready.catch(() => {})
+    await this.operationDone?.catch(() => {})
+    await this.pendingPoll?.catch(() => {})
+    await this.saves.catch(() => {})
+  }
+}
