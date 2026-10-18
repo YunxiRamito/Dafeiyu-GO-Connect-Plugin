@@ -11,17 +11,21 @@ import { PERMISSIONS, PermissionSet } from '../../src/framework/permissions.ts'
 import { ensureDiskSpace, retry, sha256Bytes, TransferStateMachine } from '../../src/framework/transfer.ts'
 import { registerConnectionCommands } from '../../src/framework/commands.ts'
 import { RemoteDshClient } from '../../src/framework/remote.ts'
+import { validateConnectionState } from '../../src/framework/launcher-provider.ts'
 
-test('配置默认关闭且 merge 保留敏感 ignoreRules', () => {
+test('连接默认共享 DSH 和广播且 merge 保留显式文件同步兼容', () => {
   const defaults = createDefaultConfig()
-  assert.equal(defaults.workspaceSync.enabled, false)
-  assert.equal(defaults.broadcast.enabled, false)
+  assert.equal(defaults.workspaceSync.enabled, true)
+  assert.equal(defaults.workspaceSync.kind, 'dsh')
+  assert.equal(defaults.workspaceSync.root, null)
+  assert.equal(defaults.broadcast.enabled, true)
   assert.ok(defaults.workspaceSync.ignoreRules.includes('node_modules'))
   assert.ok(defaults.workspaceSync.ignoreRules.includes('*.pem'))
   const merged = mergeConfig({ workspaceSync: { enabled: true, root: 'G:\\workspace' } })
   assert.equal(merged.workspaceSync.enabled, true)
   assert.equal(merged.workspaceSync.root, 'G:\\workspace')
-  assert.equal(merged.broadcast.enabled, false)
+  assert.equal(merged.workspaceSync.kind, 'files')
+  assert.equal(merged.broadcast.enabled, true)
 })
 
 test('路径只允许 root 内非敏感文件', () => {
@@ -94,6 +98,26 @@ test('server_connected 与 remote online 分离，presence 状态可判定', () 
   assert.equal(classifyConnectionState({ server_connected: true, pairing_status: 'paired', remote_device: { online: 'offline' } }), 'remote_offline')
   assert.equal(classifyConnectionState({ server_connected: true, pairing_status: 'paired', remote_device: { online: 'online' } }), null)
   assert.equal(classifyConnectionState({ server_connected: true, pairing_status: 'paired', remote_device: null }), 'presence_unknown')
+})
+
+test('可选硬件快照支持多磁盘，旧状态仍通过验证', () => {
+  const base: any = {
+    protocol: 'dafeiyu-go.connection.v1', server_connected: true, group_id: 'g', pairing_status: 'paired',
+    local_device: { id: 'local', name: 'Local', public_key: 'pk' },
+    remote_device: { id: 'remote', name: 'PC', public_key: 'rpk', online: 'online', last_seen_at: null },
+    capabilities: { workspace_sync: true, web_broadcast: true, encrypted_messages: true, encrypted_files: true, presence: true, file_cache_cleanup: true },
+  }
+  assert.equal(validateConnectionState(base), base)
+  base.remote_device.hardware = {
+    device_name: 'PC', system: 'Windows 11', cpu: 'CPU', gpu: 'GPU',
+    memory: { used_bytes: 1, total_bytes: 2 },
+    network: { upload_bytes_per_second: 3, download_bytes_per_second: 4 },
+    storage: [{ name: 'C:', used_bytes: 5, total_bytes: 6 }, { name: 'D:', used_bytes: 7, total_bytes: 8 }],
+    updated_at: '2026-10-17T00:00:00Z',
+  }
+  base.capabilities.device_hardware = true
+  assert.equal(validateConnectionState(base), base)
+  assert.throws(() => validateConnectionState({ ...base, remote_device: { ...base.remote_device, hardware: { ...base.remote_device.hardware, storage: [{ name: 'C:', used_bytes: 'bad', total_bytes: 1 }] } } }), ConnectionPluginError)
 })
 
 test('缓存清理最多每批 100 项，使用稳定 idempotency key 并保持组隔离', async () => {

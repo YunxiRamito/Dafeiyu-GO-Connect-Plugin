@@ -94,7 +94,7 @@ test('capability changes use distinct message keys and omit ungranted settings/d
     adapter: { capabilities: () => ['remote_task', 'remote_directory', 'remote_settings'], execute: async () => ({}), cancel: async () => ({}) } })
   t.after(() => restricted.dispose())
   await restricted.advertise(state)
-  assert.deepEqual(messages(provider, 'dsh_remote_capabilities').at(-1).body.capabilities, ['remote_task'])
+  assert.deepEqual(messages(provider, 'dsh_remote_capabilities').at(-1).body.capabilities, ['remote_task', 'remote_result_chunks_v1'])
   await assert.rejects(() => restricted.receive('grp_remote', request('directory_gate_123', 'directory.list')), (error: any) => error.code === 'permission_denied')
 })
 
@@ -285,7 +285,7 @@ test('oversized UTF-8 results fail with a bounded error instead of transport ove
   } })
   t.after(() => host.dispose())
   await host.receive('grp_remote', request('oversized_result_123')); await until(() => messages(provider).length === 1)
-  assert.deepEqual(messages(provider)[0].body.payload, { code: 'protocol_error' })
+  assert.deepEqual(messages(provider)[0].body.payload, { code: 'unsupported' })
 })
 
 test('Cordis services loaded after Connect activate only real available capabilities', () => {

@@ -2,7 +2,7 @@
 
 Dafeiyu-GO / DSH-Aries 的设备连接扩展插件，供 PC 和 Android 宿主使用同一份代码及冻结包。插件只调用启动器提供的高层 `ConnectionProvider`，协议为 `dafeiyu-go.connection.v1`；设备身份、配对、TLS 和内容加密由原生宿主管理。
 
-当前源码版本为 **0.3.0 候选**，包含远程任务、工作区信息、模型目录、设置适配、网页隧道和文件传输协议。源码公开不代表这些能力已经通过双端端到端验收。同步和广播默认关闭；网页、产物、附件及归档永久删除仍按真实宿主能力和权限门控，未通过验收的生产 gate 保持关闭。没有可用 endpoint 或注入 provider 时返回 `waiting_for_launcher` / `launcher_unavailable`，不会伪造连接状态、远端在线状态或操作成功。
+当前源码版本为 **0.3.1 本地候选**，连接默认共享电脑 DSH 的工作区、对话与网页。工作区共享调用实际 DSH registry/session 服务，不扫描或复制工作区目录文件。网页能力必须通过本机认证首页读取和实际 Gateway 服务检查；服务未就绪时等待，不能只凭配置伪造可用。产物、附件及归档永久删除继续保留各自验证门控。没有可用 endpoint 或注入 provider 时返回 `waiting_for_launcher` / `launcher_unavailable`，不会伪造连接状态、远端在线状态或操作成功。
 
 公开源码仓库：[YunxiRamito/Dafeiyu-GO-Connect-Plugin](https://github.com/YunxiRamito/Dafeiyu-GO-Connect-Plugin)。项目代码采用 [MIT](LICENSE)，第三方依赖与宿主组件保留各自许可证。验收与冻结边界见 [集成状态](docs/integration-status.md)。
 
@@ -28,7 +28,7 @@ npm run check
 npm run build
 ```
 
-本项目的本地测试、安装目录、缓存、压缩包和日志不进入 Git。工作站上的临时产物放在 G 盘指定 QA 目录；请把 npm cache、临时目录和命令输出指向该目录。插件不保存 Aries 私钥、内容密钥、token 或 cookie；同步仅写入用户显式选择的工作区。不要把配对身份或真实运行目录加入仓库。
+本项目的本地测试、安装目录、缓存、压缩包和日志不进入 Git。工作站上的临时产物放在 G 盘指定 QA 目录；请把 npm cache、临时目录和命令输出指向该目录。插件不持久保存 Aries 私钥、内容密钥、token 或 cookie；DSH 共享不自动下载工作区文件。可选文件传输 API 仅在显式 `kind: files` 和选定 root 时启用。不要把配对身份或真实运行目录加入仓库。
 
 ## DSH 插件安装
 
@@ -38,7 +38,7 @@ npm run build
 
 ## 冻结与发布
 
-PC 与 Android 必须使用版本、字节数、SHA-256 完全一致的冻结包。当前宿主 pin 仍为 200,430 字节、SHA-256 `4f3657730459197835a014b7f7433b44cc652e5b32480cdb37c061b160e75bf2` 的 0.3.0 候选；该历史归档没有包含根 MIT `LICENSE`。源码已补齐完整许可，后续重新打包必须核验归档含 `package/LICENSE`，并由发布负责人同时更新双端 pin。
+PC 与 Android 必须使用版本、字节数、SHA-256 完全一致的冻结包。0.3.1 必须重新冻结并同步双端 pin，不能用相同 0.3.0 版本覆盖旧候选；包清单明确包含 `LICENSE`，冻结后核验实际 `package/LICENSE`。历史 0.3.0 候选 200,430 字节／`4f3657730459197835a014b7f7433b44cc652e5b32480cdb37c061b160e75bf2` 保留作旧证据。
 
-公开源码提交不会替换已发布 Android 0.1.25 的安装包或冻结包。重新冻结及宿主生产改动应进入后续 Android 0.1.26／code27。通过完整许可检查、双端摘要一致及必要生产 gate 验收前，不创建插件 tag、GitHub Release 或在线 feed 发布。
+本地修复不会替换已发布 Android 安装包或线上 feed；正式发布、设备安装和跨端公网验收必须另有真实证据。
 

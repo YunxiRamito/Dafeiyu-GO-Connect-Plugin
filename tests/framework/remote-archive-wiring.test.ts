@@ -59,12 +59,12 @@ test('late verified service refresh changes advertisement once and ungranted arc
   t.after(() => host.dispose())
   await host.advertise(state); await host.advertise(state)
   assert.equal(refreshes, 2)
-  assert.deepEqual(messages(provider, 'dsh_remote_capabilities').map(value => value.capabilities), [['remote_archive_delete', 'remote_task']])
+  assert.deepEqual(messages(provider, 'dsh_remote_capabilities').map(value => value.capabilities), [['remote_archive_delete', 'remote_task', 'remote_result_chunks_v1']])
   const denied = new RemoteDshHost({ provider, adapter,
     permissions: new PermissionSet(PERMISSIONS.filter(value => value !== 'connection.remote.archive.delete')), stateDirectory: await directory() })
   t.after(() => denied.dispose())
   await denied.advertise(state)
-  assert.deepEqual(messages(provider, 'dsh_remote_capabilities').at(-1).capabilities, ['remote_task'])
+  assert.deepEqual(messages(provider, 'dsh_remote_capabilities').at(-1).capabilities, ['remote_task', 'remote_result_chunks_v1'])
   await assert.rejects(() => denied.receive(state.group_id, envelope('archive_denied_123', 'session.archived.delete',
     { ticket: 'ticket-123', confirmDelete: true })), (error: any) => error.code === 'permission_denied')
 })

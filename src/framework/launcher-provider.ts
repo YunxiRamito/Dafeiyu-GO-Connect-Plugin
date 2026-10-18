@@ -1,7 +1,21 @@
 import { ConnectionPluginError } from './errors.ts'
 import { makeRequestId, type IpcTransport } from './ipc.ts'
 import { IPC_PROTOCOL } from './node-transport.ts'
-import type { ConnectionProvider, ConnectionState, ProviderResult, RemoteHttpRequest, RemoteHttpResponse, RemoteTaskEvent, RemoteTaskRequest, RemoteTaskResult } from './provider.ts'
+import type { ConnectionProvider, ConnectionState, HardwareSnapshot, ProviderResult, RemoteHttpRequest, RemoteHttpResponse, RemoteTaskEvent, RemoteTaskRequest, RemoteTaskResult } from './provider.ts'
+
+function validHardwareSnapshot(value: unknown): value is HardwareSnapshot {
+  if (!value || typeof value !== 'object') return false
+  const v = value as any
+  const memory = v.memory
+  const network = v.network
+  return typeof v.device_name === 'string' && typeof v.system === 'string' && typeof v.cpu === 'string' && typeof v.gpu === 'string' &&
+    typeof v.updated_at === 'string' && !!memory && typeof memory.used_bytes === 'number' && Number.isFinite(memory.used_bytes) &&
+    typeof memory.total_bytes === 'number' && Number.isFinite(memory.total_bytes) && !!network &&
+    typeof network.upload_bytes_per_second === 'number' && Number.isFinite(network.upload_bytes_per_second) &&
+    typeof network.download_bytes_per_second === 'number' && Number.isFinite(network.download_bytes_per_second) &&
+    Array.isArray(v.storage) && v.storage.every((item: any) => item && typeof item.name === 'string' &&
+      typeof item.used_bytes === 'number' && Number.isFinite(item.used_bytes) && typeof item.total_bytes === 'number' && Number.isFinite(item.total_bytes))
+}
 
 export function validateConnectionState(value: ConnectionState): ConnectionState {
   if (!value || value.protocol !== IPC_PROTOCOL || typeof value.server_connected !== 'boolean' ||
@@ -10,8 +24,9 @@ export function validateConnectionState(value: ConnectionState): ConnectionState
       !value.local_device || typeof value.local_device.id !== 'string' || !value.capabilities ||
       ['workspace_sync', 'web_broadcast', 'encrypted_messages', 'encrypted_files', 'presence', 'file_cache_cleanup']
         .some(key => typeof (value.capabilities as any)[key] !== 'boolean') ||
-      (value.remote_device && !['online', 'offline', 'unknown'].includes(value.remote_device.online)) ||
-      ['remote_task', 'remote_directory', 'remote_settings', 'remote_web_tunnel', 'remote_workspace_lifecycle', 'remote_archive_delete', 'remote_artifacts', 'remote_attachments']
+      (value.remote_device && (!['online', 'offline', 'unknown'].includes(value.remote_device.online) ||
+        (value.remote_device.hardware !== undefined && !validHardwareSnapshot(value.remote_device.hardware)))) ||
+      ['device_hardware', 'remote_task', 'remote_directory', 'remote_settings', 'remote_web_tunnel', 'remote_workspace_lifecycle', 'remote_archive_delete', 'remote_artifacts', 'remote_attachments']
         .some(key => (value.capabilities as any)[key] !== undefined && typeof (value.capabilities as any)[key] !== 'boolean'))
     throw new ConnectionPluginError('protocol_error', 'Invalid connection snapshot.')
   return value

@@ -255,7 +255,7 @@ async function* publicWebEvents(ctx: any, signal: AbortSignal): AsyncIterable<un
 
 interface SocketState { scope: string; requestId: string; controller: AbortController; queue: WebQueue<unknown>; streams: Map<string, AbortController>; sequence: number; lastHash?: string; writes: Promise<void>; timer: ReturnType<typeof setTimeout> }
 
-/** Wraps the production typed adapter, with the web capability deliberately off until real E2E is recorded. */
+/** Advertises web only after the real local authenticated server is readable. */
 export function createCordisRemoteWebAdapter(ctx: any, base: RemoteDshHostAdapter): RemoteDshHostAdapter {
   const get = (key: string) => typeof ctx?.get === 'function' ? ctx.get(key) : ctx?.[key]
   const rpc = new RemoteWebRpcRouter(base, () => get('typertGateway'), signal => publicWebEvents(ctx, signal))
@@ -266,6 +266,29 @@ export function createCordisRemoteWebAdapter(ctx: any, base: RemoteDshHostAdapte
   }, root => { if (typeof get('connection')?.authenticatedUrl !== 'function') fail('unsupported', 'PC web authentication is unavailable.'); return get('connection').authenticatedUrl(root) })
   const responses = new Map<string, { status: number; headers: Record<string, string>; body: Buffer }>()
   const httpPending = new Set<string>()
+  let webReady = false
+  let closed = false
+  let checkedAt = 0
+  let readiness: Promise<void> | undefined
+  const refreshCapabilities = async () => {
+    await base.refreshCapabilities?.()
+    const port = get('webServer')?.port
+    const gateway = get('typertGateway')
+    if (closed || !base.capabilities().includes('remote_task') || !Number.isSafeInteger(port) || port < 1 || port > 65535 ||
+        typeof get('connection')?.authenticatedUrl !== 'function' || typeof gateway?.invoke !== 'function' ||
+        typeof gateway?.wireStream?.open !== 'function' || typeof ctx?.on !== 'function') { webReady = false; checkedAt = 0; return }
+    if (readiness) return readiness
+    if (webReady && Date.now() - checkedAt < 15_000) return
+    readiness = (async () => {
+      try {
+        const response = await staticClient.get(validateRemoteWebHttp({ method: 'GET', path: '/' }), AbortSignal.timeout(5000))
+        webReady = !closed && response.status === 200 && /text\/html/i.test(response.headers['content-type'] ?? '')
+        response.body.fill(0)
+      } catch { webReady = false }
+      finally { checkedAt = Date.now(); readiness = undefined }
+    })()
+    return readiness
+  }
   const sockets = new Map<string, SocketState>()
   const scope = (context?: RemoteDshHostContext) => { if (!context) fail('permission_denied', 'Web calls require authenticated sender context.'); return `${context.group}\0${context.peer}` }
   const socketFor = (payload: Record<string, any>, context?: RemoteDshHostContext) => {
@@ -282,13 +305,13 @@ export function createCordisRemoteWebAdapter(ctx: any, base: RemoteDshHostAdapte
     sockets.delete(id)
   }
   return {
-    capabilities: () => base.capabilities(),
-    refreshCapabilities: () => base.refreshCapabilities?.() ?? Promise.resolve(),
+    capabilities: () => [...base.capabilities(), ...(webReady && !closed ? ['remote_web_tunnel'] : [])],
+    refreshCapabilities,
     revoke: async (group, peer) => {
       for (const [id, state] of sockets) if (state.scope === `${group}\0${peer}` || peer === undefined && state.scope.startsWith(`${group}\0`)) close(id)
       await base.revoke?.(group, peer)
     },
-    dispose: async () => { for (const id of sockets.keys()) close(id); responses.clear(); await base.dispose?.() },
+    dispose: async () => { closed = true; webReady = false; for (const id of sockets.keys()) close(id); responses.clear(); await readiness; await base.dispose?.() },
     execute: async (operation, payload, requestId, signal, context) => {
       if (!REMOTE_WEB_OPERATIONS.includes(operation as any)) return base.execute(operation, payload, requestId, signal, context)
       active(signal); scope(context)

@@ -6,7 +6,7 @@ export interface ConnectionState {
   group_id: string | null
   pairing_status: 'paired' | 'unpaired' | 'awaiting_approval' | 'unknown' | 'revoked'
   local_device: { id: string; name: string; public_key: string }
-  remote_device: { id: string; name: string; public_key: string; online: 'online' | 'offline' | 'unknown'; last_seen_at: string | null } | null
+  remote_device: RemoteDevice | null
   members?: Array<{ id: string; public_key?: string; role?: string; active?: boolean; online?: 'online' | 'offline' | 'unknown' }>
   capabilities: {
     workspace_sync: boolean
@@ -16,6 +16,8 @@ export interface ConnectionState {
     presence: boolean
     file_cache_cleanup: boolean
     /** Optional 0.3.0 capabilities. Unknown keys remain forward compatible. */
+    /** Optional hardware snapshot advertised by the peer. */
+    device_hardware?: boolean
     remote_task?: boolean
     remote_directory?: boolean
     remote_workspace_lifecycle?: boolean
@@ -25,6 +27,43 @@ export interface ConnectionState {
     remote_settings?: boolean
     remote_web_tunnel?: boolean
   }
+}
+
+export interface HardwareMemorySnapshot {
+  used_bytes: number
+  total_bytes: number
+}
+
+export interface HardwareNetworkSnapshot {
+  upload_bytes_per_second: number
+  download_bytes_per_second: number
+}
+
+export interface HardwareStorageSnapshot {
+  name: string
+  used_bytes: number
+  total_bytes: number
+}
+
+export interface HardwareSnapshot {
+  device_name: string
+  system: string
+  cpu: string
+  gpu: string
+  memory: HardwareMemorySnapshot
+  network: HardwareNetworkSnapshot
+  storage: HardwareStorageSnapshot[]
+  updated_at: string
+}
+
+export interface RemoteDevice {
+  id: string
+  name: string
+  public_key: string
+  online: 'online' | 'offline' | 'unknown'
+  last_seen_at: string | null
+  /** Omitted by older peers and servers that do not implement device_hardware. */
+  hardware?: HardwareSnapshot
 }
 
 export interface ProviderResponse<T> { success: true; request_id: string; data: T }

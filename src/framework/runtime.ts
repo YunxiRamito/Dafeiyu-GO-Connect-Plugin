@@ -20,7 +20,8 @@ import type { RemoteDshHost } from './remote-host.ts'
 
 export type ConfigPatch = { [K in keyof PluginConfig]?: Partial<PluginConfig[K]> }
 export function patchConfig(base: PluginConfig, patch: ConfigPatch = {}): PluginConfig {
-  return mergeConfig({ workspaceSync: { ...base.workspaceSync, ...patch.workspaceSync },
+  return mergeConfig({ workspaceSync: { ...base.workspaceSync, ...patch.workspaceSync,
+    kind: patch.workspaceSync?.kind ?? (patch.workspaceSync?.root ? 'files' : base.workspaceSync.kind) },
     broadcast: { ...base.broadcast, ...patch.broadcast }, limits: { ...base.limits, ...patch.limits } })
 }
 interface Conflict { group_id: string; transfer_id: string; relative_path: string; local_hash: string | null; remote_hash: string }
@@ -93,6 +94,8 @@ export class ConnectionRuntime {
             !value.groups || !Array.isArray(value.conflicts) || !value.baselines)
           throw new Error('invalid_state')
         this.durable = { ...value, config: patchConfig(mergeConfig(value.config), this.options.config) }
+        if (value.config.workspaceSync?.kind === undefined && !this.options.config?.workspaceSync?.root)
+          this.durable.config = patchConfig(this.durable.config, { workspaceSync: { enabled: true, kind: 'dsh', root: null }, broadcast: { enabled: true } })
       } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
     }
     this.applyConfig({})
@@ -130,7 +133,9 @@ export class ConnectionRuntime {
         throw new ConnectionPluginError('validation_failed', 'Workspace root must be an explicitly selected absolute path.')
       next.workspaceSync.root = path.resolve(next.workspaceSync.root)
     }
-    if (typeof next.workspaceSync.enabled !== 'boolean' || (next.workspaceSync.root !== null && typeof next.workspaceSync.root !== 'string') ||
+    if (typeof next.workspaceSync.enabled !== 'boolean' || !['dsh', 'files'].includes(next.workspaceSync.kind) ||
+        (next.workspaceSync.dshHome !== null && (typeof next.workspaceSync.dshHome !== 'string' || !path.isAbsolute(next.workspaceSync.dshHome))) ||
+        (next.workspaceSync.root !== null && typeof next.workspaceSync.root !== 'string') ||
         !['manual', 'watch'].includes(next.workspaceSync.mode) || !['ask', 'keep_local', 'keep_remote', 'keep_both'].includes(next.workspaceSync.conflictPolicy) ||
         typeof next.broadcast.enabled !== 'boolean' || !Number.isSafeInteger(next.limits.chunkBytes) ||
         next.limits.chunkBytes < 1 || next.limits.chunkBytes > 512 * 1024 ||
@@ -148,14 +153,18 @@ export class ConnectionRuntime {
     if (!this.home) return
     try {
       const value = await readBoundedJson(path.join(this.home, 'dafeiyu-connection-preferences.json'))
-      if (value.schema_version !== 1 || typeof value.workspace_sync?.enabled !== 'boolean' ||
-          (value.workspace_sync.root !== null && typeof value.workspace_sync.root !== 'string') ||
-          typeof value.web_broadcast?.enabled !== 'boolean')
+      if (![1, 2].includes(value.schema_version) || typeof value.workspace_sync?.enabled !== 'boolean' ||
+          typeof value.web_broadcast?.enabled !== 'boolean' ||
+          (value.schema_version === 2 && (value.workspace_sync.kind !== 'dsh' ||
+            typeof value.workspace_sync.dsh_home !== 'string' || !this.home ||
+            path.resolve(value.workspace_sync.dsh_home) !== path.resolve(this.home))))
         throw new Error('invalid_preferences')
       const fingerprint = JSON.stringify(value)
       if (fingerprint !== this.nativeFingerprint) {
-        this.applyConfig({ workspaceSync: { enabled: value.workspace_sync.enabled, root: value.workspace_sync.root },
-          broadcast: { enabled: value.web_broadcast.enabled } })
+        // Connection means DSH workspace/conversation sharing and web access.
+        // Old toggles and arbitrary roots are migrated without reading files.
+        this.applyConfig({ workspaceSync: { enabled: true, kind: 'dsh', dshHome: this.home, root: null },
+          broadcast: { enabled: true } })
         await this.save()
         this.nativeFingerprint = fingerprint
       }
@@ -268,7 +277,12 @@ export class ConnectionRuntime {
       if (allHandled && response.next_cursor) checkpoint.cursor = response.next_cursor
       await this.save()
     }
-    if (this.durable.config.workspaceSync.enabled && !this.durable.paused && !this.operationDone) {
+    if (this.durable.config.workspaceSync.enabled && this.durable.config.workspaceSync.kind === 'dsh') {
+      // Actual services are shared by RemoteDshHost; no directory/file scan.
+      const capabilities = await this.remoteHost?.availableCapabilities() ?? []
+      this.syncStatus = ['remote_task', 'remote_directory'].every(value => capabilities.includes(value)) ? 'completed' : 'waiting_for_host'
+    }
+    if (this.durable.config.workspaceSync.enabled && this.durable.config.workspaceSync.kind === 'files' && !this.durable.paused && !this.operationDone) {
       const operation = new AbortController()
       const cancel = () => operation.abort()
       this.stop.signal.addEventListener('abort', cancel, { once: true })
@@ -361,6 +375,14 @@ export class ConnectionRuntime {
     this.permissions.require('connection.file.transfer')
     if (this.durable.paused) return { status: 'paused' }
     if (!this.durable.config.workspaceSync.enabled) return { status: 'disabled' }
+    if (this.durable.config.workspaceSync.kind === 'dsh') {
+      if (relative) throw new ConnectionPluginError('permission_denied', 'DSH sharing does not transfer workspace files.')
+      const state = await this.current(signal)
+      await this.remoteHost?.advertise(state)
+      const capabilities = await this.remoteHost?.availableCapabilities() ?? []
+      this.syncStatus = ['remote_task', 'remote_directory'].every(value => capabilities.includes(value)) ? 'completed' : 'waiting_for_host'
+      return { status: this.syncStatus }
+    }
     // A receive operation must not consume a later explicit upload intent.
     while (this.operationDone) {
       await this.operationDone.catch(() => {})

@@ -8,6 +8,9 @@ export type ConflictPolicy = 'ask' | 'keep_local' | 'keep_remote' | 'keep_both'
 
 export interface WorkspaceSyncConfig {
   enabled: boolean
+  /** DSH metadata/live conversations never traverse or transfer workspace files. */
+  kind: 'dsh' | 'files'
+  dshHome: string | null
   root: string | null
   mode: SyncMode
   conflictPolicy: ConflictPolicy
@@ -41,14 +44,16 @@ export interface PluginConfig {
 export function createDefaultConfig(): PluginConfig {
   return {
     workspaceSync: {
-      enabled: false,
+      enabled: true,
+      kind: 'dsh',
+      dshHome: null,
       root: null,
       mode: 'manual',
       conflictPolicy: 'ask',
       ignoreRules: [...DEFAULT_IGNORE_RULES],
     },
     broadcast: {
-      enabled: false,
+      enabled: true,
       allowLocalHttp: false,
       includeSelection: false,
       receivePaused: false,
@@ -77,6 +82,9 @@ export function mergeConfig(input: Partial<PluginConfig> | undefined): PluginCon
     workspaceSync: {
       ...defaults.workspaceSync,
       ...(value.workspaceSync ?? {}),
+      // Keep the old explicit file-transfer API opt-in; native preferences
+      // migrate separately and must never turn DSH_HOME into a file root.
+      kind: value.workspaceSync?.kind ?? (value.workspaceSync?.root ? 'files' : defaults.workspaceSync.kind),
       ignoreRules: [...(value.workspaceSync?.ignoreRules ?? defaults.workspaceSync.ignoreRules)],
     },
     broadcast: { ...defaults.broadcast, ...(value.broadcast ?? {}) },

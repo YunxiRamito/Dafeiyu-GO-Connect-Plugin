@@ -88,27 +88,27 @@ IPC 应使用现有安全本地通道，例如 Windows Named Pipe 或启动器�
 
 ## 工作区同步契约
 
-默认配置为：
+连接默认使用 DSH 语义。原生偏好 schema2 为：
 
 ```json
 {
-  "workspaceSync": {
-    "enabled": false,
-    "root": null,
-    "mode": "manual",
-    "conflictPolicy": "ask",
-    "ignoreRules": ["node_modules", ".git", ".cache", "dist", "build", "*.log", "*.tmp", "secrets", "*.key", "*.pem", "*.p12", "*.pfx", "*.env", "cookies", "tokens", "credentials"]
-  }
+  "schema_version": 2,
+  "workspace_sync": { "enabled": true, "kind": "dsh", "dsh_home": "G:/actual-dsh-home" },
+  "web_broadcast": { "enabled": true }
 }
 ```
 
-只同步用户明确选择的 root，不扫描磁盘。路径必须经过 `decideSyncPath`；越出 root、命中 ignore rule、`.key/.pem/.p12/.pfx/.env`、token/cookie/credential/secret/password/auth 路径均拒绝。上传使用相对文件标识，不能上传完整绝对路径。
+`dsh_home` 必须等于宿主传入的实际 `DSH_HOME`，只用于标识同一 DSH 环境，不作为文件 root。插件通过 `workspaceRegistry.list`、`sessionController.list/follow/control` 分享工作区和对话，通过有界公开投影去除凭据与私有重放上下文；远端使用独立接收状态。旧 schema1 的任意 root 和关闭开关迁移为默认 DSH 共享，不读取旧 root。
+
+以下文件传输契约只供显式 `workspaceSync.kind: files` 的兼容 API 使用，不属于默认连接行为。只同步明确选择的 root，不扫描其他磁盘。路径必须经过 `decideSyncPath`；越出 root、命中 ignore rule、`.key/.pem/.p12/.pfx/.env`、token/cookie/credential/secret/password/auth 路径均拒绝。上传使用相对文件标识，不能上传完整绝对路径。
 
 元数据通过启动器加密消息传输，文件内容通过启动器加密 resumable file-transfer 传输。大文件分块，一个文件的并发操作串行，队列和并发数有限制，文件事件需 debounce。上传完成必须以 Provider 确认作为事实。接收端应使用临时文件、hash 校验和原子替换，不能静默覆盖本地修改。冲突策略为 `ask`、`keep_local`、`keep_remote` 或 `keep_both`，默认 `ask`。
 
 同步状态至少包括 `disabled`、`waiting_for_launcher`、`waiting_for_connection`、`syncing`、`paused`、`conflict`、`failed`、`completed` 和 `unknown`。中断恢复使用 transfer id 与已确认 chunk，不改变原文件；取消和失败都必须可恢复。
 
 ## 网页广播契约
+
+连接默认广播 DSH 网页：真实本机 webServer 端口、authenticatedUrl、Gateway invoke/wireStream 与事件源齐备，并通过认证首页 200 HTML 读取后，才广告 `remote_web_tunnel`。广告每 15 秒刷新；服务缺失时撤回能力。手机只接受当前已配对电脑的认证广告，经本机 loopback proxy 展示网页；不会传播上游 token 或 cookie。下列安全链接消息保留为额外兼容命令，不代替 DSH 网页隧道。
 
 payload 只包含安全网页信息：
 

@@ -1,6 +1,6 @@
 {
   "name": "dafeiyu-go-connect",
-  "version": "0.3.0",
+  "version": "0.3.2",
   "private": true,
   "type": "module",
   "description": "Dafeiyu-Go / DSH-Aries connection plugin for encrypted group transport, remote DSH tasks, workspace metadata and safe web tunneling.",
@@ -28,6 +28,7 @@
     "cordis.patch.yml",
     "package.json",
     "README.md",
+    "LICENSE",
     "scripts/"
   ],
   "dsh": {
